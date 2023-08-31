@@ -1,0 +1,111 @@
+#pragma kernel PrecomputeTwiddleFactorsAndInputIndices
+#pragma kernel HorizontalFFT
+#pragma kernel VerticalFFT
+#pragma kernel HorizontalIFFT
+#pragma kernel VerticalIFFT
+#pragma kernel Scale
+#pragma kernel Permute
+
+static const float PI = 3.1415926;
+
+RWTexture2D<float4> PrecomputeBuffer;
+RWTexture2D<float2> Buffer0;
+RWTexture2D<float2> Buffer1;
+Texture2D<float4> PrecomputeData;
+bool PingPong;  //交换输入输出，上一阶段的输出为下一阶段的输入
+uint Step;  //表示当前在哪一个stage
+uint Size;
+
+float2 ComplexMul(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// 计算e^(a+ib) = e^a * e^(ib) = e^a * (cosb + isinb)
+float2 ComplexExp(float2 a)
+{
+    return float2(cos(a.y), sin(a.y)) * exp(a.x);
+}
+
+[numthreads(1,8,1)]
+void PrecomputeTwiddleFactorsAndInputIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint b = Size >> (id.x + 1);
+    uint i = (2 * b * (id.y / b) + id.y % b) % Size;
+    float2 exponent = 2 * PI * float2(0, 1) / Size;
+    float2 twiddle = ComplexExp(-exponent * ((id.y / b) * b));
+    PrecomputeBuffer[id.xy] = float4(twiddle, i, i + b);
+    PrecomputeBuffer[uint2(id.x, id.y + Size / 2)] = float4(-twiddle, i, i + b);
+}
+
+[numthreads(8,8,1)]
+void HorizontalFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = PrecomputeData[uint2(Step, id.x)];
+    uint2 inputsIndices = (uint2)data.zw;
+    if (PingPong)
+    {
+        Buffer1[id.xy] = Buffer0[uint2(inputsIndices.x, id.y)] + ComplexMul(data.xy, Buffer0[uint2(inputsIndices.y, id.y)]);
+    }
+    else
+    {
+        Buffer0[id.xy] = Buffer1[uint2(inputsIndices.x, id.y)] + ComplexMul(data.xy, Buffer1[uint2(inputsIndices.y, id.y)]);
+    }
+}
+
+[numthreads(8,8,1)]
+void VerticalFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = PrecomputeData[uint2(Step, id.y)];
+    uint2 inputsIndices = (uint2)data.zw;
+    if (PingPong)
+    {
+        Buffer1[id.xy] = Buffer0[uint2(id.x, inputsIndices.x)] + ComplexMul(data.xy, Buffer0[uint2(id.x, inputsIndices.y)]);
+    }
+    else
+    {
+        Buffer0[id.xy] = Buffer1[uint2(id.x, inputsIndices.x)] + ComplexMul(data.xy, Buffer1[uint2(id.x, inputsIndices.y)]);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void HorizontalIFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = PrecomputeData[uint2(Step, id.x)];
+    uint2 inputsIndices = (uint2)data.zw;
+    if (PingPong)
+    {
+        Buffer1[id.xy] = Buffer0[uint2(inputsIndices.x, id.y)] + ComplexMul(float2(data.x, -data.y), Buffer0[uint2(inputsIndices.y, id.y)]);
+    }
+    else
+    {
+        Buffer0[id.xy] = Buffer1[uint2(inputsIndices.x, id.y)] + ComplexMul(float2(data.x, -data.y), Buffer1[uint2(inputsIndices.y, id.y)]);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void VerticalIFFT(uint3 id : SV_DispatchThreadID)
+{
+    float4 data = PrecomputeData[uint2(Step, id.y)];
+    uint2 inputsIndices = (uint2)data.zw;
+    if (PingPong)
+    {
+        Buffer1[id.xy] = Buffer0[uint2(id.x, inputsIndices.x)] + ComplexMul(float2(data.x, -data.y), Buffer0[uint2(id.x, inputsIndices.y)]);
+    }
+    else
+    {
+        Buffer0[id.xy] = Buffer1[uint2(id.x, inputsIndices.x)] + ComplexMul(float2(data.x, -data.y), Buffer1[uint2(id.x, inputsIndices.y)]);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Scale(uint3 id : SV_DispatchThreadID)
+{
+    Buffer0[id.xy] = Buffer0[id.xy] / Size / Size;
+}
+
+[numthreads(8, 8, 1)]
+void Permute(uint3 id : SV_DispatchThreadID)
+{
+    Buffer0[id.xy] = Buffer0[id.xy] * (1.0 - 2.0 * ((id.x + id.y) % 2));
+}

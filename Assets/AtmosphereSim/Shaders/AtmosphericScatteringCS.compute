@@ -1,0 +1,117 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSIntegrateAtmosphereDensityToTop
+#pragma kernel CSPrecomputeSunParams
+#pragma kernel CSIntegrateAmbientLight
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "./AtmosphericScatteringCommon.hlsl"
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float2> _RWIntegrateAtmosphereDensityToTopLUT;
+RWTexture2D<float3> _RWSunParamsLUT;
+RWTexture2D<float3> _RWAmbientLightLUT;
+Texture2D<float3> _RandomVectorLUT;
+
+SamplerState sampler_TrilinearClamp;
+SamplerState sampler_PointClamp;
+
+
+// =================================================================================
+// 预计算在某一高度下，此点距离大气层的光学距离（累积大气密度）
+// =================================================================================
+// SV_DispatchThreadID表示当前线程在所有派遣的线程中的ID
+// 由于z为1，所以x和y可以类比于屏幕空间坐标，而width，height看作屏幕分辨率
+// 故UV可以通过相除求出
+[numthreads(8,8,1)]
+void CSIntegrateAtmosphereDensityToTop(uint3 id : SV_DispatchThreadID)
+{
+    int width, height;
+    _RWIntegrateAtmosphereDensityToTopLUT.GetDimensions(width, height);
+
+    //获取当前“UV”
+    float uv_x = (float)id.x / width;
+    float uv_y = (float)id.y / height;
+
+    float cosAngle = uv_x * 2.0 - 1.0;
+    float sinAngle = sqrt(1 - cosAngle * cosAngle);
+    float startHeight = lerp(0.0, _AtmosphereHeight, uv_y);
+
+    //大气密度LUT，横坐标为天顶角cos值，纵坐标为当前距地表的高度
+    //rayDir为xOy平面上的圆，因为大气的对称性，可以忽略y轴旋转，故此圆可以视为绕y轴一周形成一个球体
+    float3 rayStart = float3(0, startHeight, 0);
+    float3 rayDir = float3(sinAngle, cosAngle, 0);
+    _RWIntegrateAtmosphereDensityToTopLUT[id.xy] = PrecomputeAtmosphereDensityToTop(rayStart, rayDir);
+}
+
+// =================================================================================
+// 计算任意高度任意天顶角下 太阳强度、颜色参数Lut
+// =================================================================================
+float3 Transmittance(float u_cosAngle, float v_startHeight)
+{
+    // 使用三线性Clamp模式的采样器
+    // 只采样cos大于0的部分，cos小于0时，太阳下山看不见了
+    float2 densityToTop = _AtmosphereDensityToTopLUT.SampleLevel(sampler_TrilinearClamp, float2(u_cosAngle, v_startHeight), 0.0).rg;
+    float3 TrToTop = densityToTop.x * _RayleighExt;
+    float3 TmToTop = densityToTop.y * _MieExt;
+    return exp(-(TrToTop + TmToTop));
+}
+
+[numthreads(8,8,1)]
+void CSPrecomputeSunParams(uint3 id : SV_DispatchThreadID)
+{
+    int width, height;
+    _RWSunParamsLUT.GetDimensions(width, height);
+
+    float u_cosAngle = (float)id.x / width;
+    float v_startHeight = (float)id.y / height;
+
+    _RWSunParamsLUT[id.xy] = _IncomingLight.rgb * Transmittance(u_cosAngle, v_startHeight);
+}
+
+// =================================================================================
+// 计算半球面上的累计环境光
+// =================================================================================
+float3 PrecomputeAmbientLight(float cosAngle, int width)
+{
+    float3 rayPos = float3(0,0,0);
+    float3 planetCenter = float3(0,-_PlanetRadius,0);
+    float sinAngle = sqrt(1 - cosAngle * cosAngle);
+    float3 lightDir = float3(sinAngle, cosAngle, 0);
+    float3 ambientColor = 0;
+    float xBias = (float)1 / width / 2; //为了采样时能准确采到单个像素中间值
+    for (int i = 0; i < width; i++)
+    {
+        float3 rayDir = _RandomVectorLUT.SampleLevel(sampler_PointClamp, float2((float)i / width + xBias, 0.5), 0.0).rgb;
+        float2 intersection = RaySphereIntersection(rayPos, rayDir, planetCenter, _PlanetRadius + _AtmosphereHeight);
+        float rayLength = intersection.y;
+
+        intersection = RaySphereIntersection(rayPos, rayDir, planetCenter, _PlanetRadius);
+        if (intersection.x >= 0)
+        {
+            rayLength = min(rayLength, intersection.x);
+        }
+
+        float integrateSample = 32;
+        float3 extinction;
+        float4 inscattering = IntegrateInscattering(rayPos, rayDir, rayLength, planetCenter, 1, lightDir, integrateSample, extinction);
+        ambientColor += dot(rayDir,float3(0,1,0)) * inscattering.rgb;
+    }
+    //半球面积分
+    return ambientColor * 2 * PI / width;
+}
+
+//1DLut，横坐标为天顶角cos
+[numthreads(8,1,1)]
+void CSIntegrateAmbientLight(uint3 id : SV_DispatchThreadID)
+{
+    int width, height;
+    _RWAmbientLightLUT.GetDimensions(width, height);
+
+    float uv_x = (float)id.x / width;
+    // cosAngle<0，即天顶角大于90度时，环境光为0
+    float cosAngle = uv_x; // * 2.0 - 1.0;
+
+    _RandomVectorLUT.GetDimensions(width, height);
+    _RWAmbientLightLUT[int2(id.x, 0)] = PrecomputeAmbientLight(cosAngle, width);
+}
